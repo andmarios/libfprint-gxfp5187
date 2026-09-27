@@ -10,7 +10,8 @@ so `fprintd`, `pam_fprintd`, GNOME and KDE work with the sensor unchanged.
 The driver is based on
 [libfprint-goodixtls](https://github.com/Sigfrodr/libfprint-goodixtls) by
 Benjamin Allègre. The patches in this repository carry its history and
-authorship.
+authorship; the same commits, on top of libfprint 1.94.100, are on the
+[`gxfp5187` branch of andmarios/libfprint](https://github.com/andmarios/libfprint/tree/gxfp5187).
 
 ## Install
 
