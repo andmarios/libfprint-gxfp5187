@@ -1,0 +1,8 @@
+# Goodix GXFP5187 fingerprint sensor (Huawei MateBook X Pro): bind it to spidev
+# so libfprint's goodixtls driver can reach it. spidev has no ACPI match for
+# this ID, hence driver_override. The node stays root-only (fprintd runs as
+# root): whoever can open it can read the sensor's TLS key out of its RAM.
+ACTION=="add", SUBSYSTEM=="spi", ENV{MODALIAS}=="acpi:GXFP5187:*", \
+    ATTR{driver_override}="spidev", \
+    RUN{builtin}+="kmod load spidev", \
+    RUN+="/bin/sh -c 'echo %k > /sys/bus/spi/drivers/spidev/bind || logger -t goodixtls bind spidev failed for %k'"

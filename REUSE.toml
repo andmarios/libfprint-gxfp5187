@@ -1,0 +1,19 @@
+version = 1
+
+# Packaging files, derived from Arch Linux's libfprint package.
+[[annotations]]
+path = [
+    "PKGBUILD",
+    ".SRCINFO",
+    "*.install",
+    "*.rules",
+    "*.conf",
+]
+SPDX-FileCopyrightText = ["Arch Linux contributors", "Marios Andreopoulos"]
+SPDX-License-Identifier = "0BSD"
+
+# The driver patches are source code of libfprint.
+[[annotations]]
+path = "*.patch"
+SPDX-FileCopyrightText = ["Benjamin Allègre", "Marios Andreopoulos"]
+SPDX-License-Identifier = "LGPL-2.1-or-later"

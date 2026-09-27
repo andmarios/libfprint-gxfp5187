@@ -1,0 +1,16 @@
+post_install() {
+  cat <<'MSG'
+==> The GXFP5187 sensor is bound to spidev by a udev rule; reboot, or run:
+      modprobe -r spidev; modprobe spidev
+      udevadm trigger --action=add --subsystem-match=spi
+    then restart fprintd:  systemctl restart fprintd
+==> Enrol with fprintd-enroll, then enable pam_fprintd where you want it.
+==> If the sensor ever stops answering (fprintd reports a TLS-key or
+    session error), power the laptop OFF with the charger unplugged for a
+    couple of minutes: a plain reboot or suspend does not reset it.
+MSG
+}
+
+post_upgrade() {
+  systemctl try-restart fprintd.service >/dev/null 2>&1 || :
+}

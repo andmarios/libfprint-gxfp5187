@@ -1,0 +1,46 @@
+pkgbase = libfprint-gxfp5187
+	pkgdesc = Library for fingerprint readers, with a driver for the Goodix GXFP5187 SPI sensor (Huawei MateBook X Pro 2018)
+	pkgver = 1.94.100
+	pkgrel = 1
+	url = https://fprint.freedesktop.org/
+	install = libfprint-gxfp5187.install
+	arch = x86_64
+	groups = fprint
+	license = LGPL-2.1-or-later
+	checkdepends = cairo
+	checkdepends = umockdev
+	makedepends = git
+	makedepends = glib2-devel
+	makedepends = gobject-introspection
+	makedepends = meson
+	makedepends = python-cairo
+	makedepends = python-gobject
+	makedepends = systemd
+	depends = libgcc
+	depends = glib2
+	depends = glibc
+	depends = libgudev
+	depends = libgusb
+	depends = openssl
+	depends = pixman
+	provides = libfprint=1.94.100
+	provides = libfprint-2.so
+	conflicts = libfprint
+	source = git+https://gitlab.freedesktop.org/libfprint/libfprint.git#tag=v1.94.100
+	source = 0001-goodixtls-import-the-Goodix-GXFP5187-driver-by-Benja.patch
+	source = 0002-goodixtls-build-the-driver-in-tree.patch
+	source = 0003-goodixtls-reliable-transport-session-reuse-and-a-rot.patch
+	source = 60-goodixtls-spidev.rules
+	source = goodixtls-spidev.modprobe.conf
+	source = goodixtls-spidev.modules-load.conf
+	source = fprintd-goodixtls.conf
+	sha256sums = 18fcee9ffb2adb9ba2ea229850e9266d0bcad2df5fad556beffce6c8ba84f192
+	sha256sums = 41eaf706f13caf1598f3d2f9687fcd78e9d40b6025b66263ffc4beabf96e8b4c
+	sha256sums = 8c3bfd631382573e3bc02fd0d77372622ca11adc6d7a83909005c20b53cb5135
+	sha256sums = b15f1b873ffa595d1ec0c6c9ef58bc688bd5b1795cbac7b1412c594d0da785a9
+	sha256sums = 5da59e7189c12e5c022f9726827f903944b7059fbd473551dbf52a014c0a71dc
+	sha256sums = 3582641437341e2f27814a89c7a1bb6b91a5a3f6599e63f5696253c0d737d3bd
+	sha256sums = 9731f3b814e0282987ab3cd939c7484485cebae05b0a246d3ffb922d1a5c32ad
+	sha256sums = 7e0e49a3743a5e8ef6d560c469bf7a1c29fd45e217aa4a1581070d30a65a8d00
+
+pkgname = libfprint-gxfp5187
