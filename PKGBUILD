@@ -9,7 +9,7 @@
 pkgname=libfprint-gxfp5187
 _pkgname=libfprint
 pkgver=1.94.100
-pkgrel=1
+pkgrel=3
 pkgdesc="Library for fingerprint readers, with a driver for the Goodix GXFP5187 SPI sensor (Huawei MateBook X Pro 2018)"
 url="https://fprint.freedesktop.org/"
 arch=(x86_64)
@@ -45,6 +45,8 @@ source=(
   0001-goodixtls-import-the-Goodix-GXFP5187-driver-by-Benja.patch
   0002-goodixtls-build-the-driver-in-tree.patch
   0003-goodixtls-reliable-transport-session-reuse-and-a-rot.patch
+  0004-goodixtls-accept-the-other-plain-PSK-suites-of-newer-firmware.patch
+  0005-goodixtls-read-the-key-at-its-11034-address-after-enable.patch
   60-goodixtls-spidev.rules
   goodixtls-spidev.modprobe.conf
   goodixtls-spidev.modules-load.conf
@@ -54,6 +56,8 @@ sha256sums=('18fcee9ffb2adb9ba2ea229850e9266d0bcad2df5fad556beffce6c8ba84f192'
             '41eaf706f13caf1598f3d2f9687fcd78e9d40b6025b66263ffc4beabf96e8b4c'
             '8c3bfd631382573e3bc02fd0d77372622ca11adc6d7a83909005c20b53cb5135'
             'b15f1b873ffa595d1ec0c6c9ef58bc688bd5b1795cbac7b1412c594d0da785a9'
+            '620f43af3ab79507f221df257f4ce51fa63e29789fbda52ab231d65ed0103c11'
+            '40ef74467c2cc6d8878fc3cf15f6f4fa295cf886b07ac4f322831b34f38a71ec'
             '5da59e7189c12e5c022f9726827f903944b7059fbd473551dbf52a014c0a71dc'
             '3582641437341e2f27814a89c7a1bb6b91a5a3f6599e63f5696253c0d737d3bd'
             '9731f3b814e0282987ab3cd939c7484485cebae05b0a246d3ffb922d1a5c32ad'
