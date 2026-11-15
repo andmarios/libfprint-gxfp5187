@@ -1,0 +1,777 @@
+From: Rémi Leuci <github.yjifi@passmail.ovh>
+Date: Sun, 15 Nov 2026 02:48:08 +0100
+Subject: [PATCH] goodixtls: faster capture, background reuse, parallel matching
+
+A verification took 0.8 s before the sensor accepted a finger, then 0.7 s from
+the touch to the decision. Measured on a MateBook X Pro (firmware
+GF3288_ST411SEC_APP_11034), command by command and frame by frame:
+
+- Capture: 610 ms -> 130 ms. The vendor's activation sequence (MCU state over
+  TLS, finger-detection setup, navigation frame, register reads) was replayed
+  before every image and took 480 ms. Only the image command is sent now; the
+  frames differ from the earlier ones by the sensor's noise, straight after a
+  reset as well as on a long-lived session, and presses score the same.
+
+- Background: a verification reuses the background and the detection baseline
+  of the previous one for 60 s (boot-time clock), which makes the sensor ready
+  in 1 ms instead of 800. Seven presses scored against nineteen backgrounds
+  taken from 160 s before to 110 s after them show no trend with age. A
+  verification that does not match, or whose image is rejected, drops the
+  background, so a stale one costs one attempt at most. Enrolment always takes
+  a fresh one. When a new background is needed it takes 200 ms (two
+  calibration probes instead of four).
+
+- A press that has served a capture no longer serves the next operation: with
+  a reused background nothing else separated two verifications, and a finger
+  resting on the sensor after an unlock would have approved the next request.
+  The next operation waits for the finger to be lifted.
+
+- Settling: the capture now starts 30-90 ms after detection, once two
+  detection readings 30 ms apart no longer sink (detection fires at 65-85 % of
+  the settled level, and the activation sequence no longer delays the image).
+
+- Detection is polled every 50 ms instead of 100.
+
+- Matching: the template views are matched on four threads (42 -> 12 ms for
+  46 views) and extraction caches the gradient direction and the row maxima
+  (40 -> 19 ms). Descriptors and scores are identical, byte for byte, on the
+  recorded captures.
+
+Checked on that unit: ten normal presses out of ten accepted (scores 12-49
+against the 26 enrolled views alone), four presses of another finger at 0.
+---
+diff --git a/libfprint/drivers/goodixtls/goodix_sift.c b/libfprint/drivers/goodixtls/goodix_sift.c
+index cfdcaa1c..905db6d6 100644
+--- a/libfprint/drivers/goodixtls/goodix_sift.c
++++ b/libfprint/drivers/goodixtls/goodix_sift.c
+@@ -105,14 +105,18 @@ gx_sift_extract (const double *img, int w, int h)
+   g_autofree double *c2m = g_malloc (sizeof (double) * n);
+   g_autofree double *s2m = g_malloc (sizeof (double) * n);
+   g_autofree double *sal = g_malloc (sizeof (double) * n);
++  g_autofree double *gdir = g_malloc (sizeof (double) * n);
+   GxSiftFeatures *f;
+ 
+   gradients (img, gx, gy, w, h);
++  /* The gradient direction is computed once per pixel: descriptor windows
++   * overlap, and each pixel is read by about four of them. */
+   for (i = 0; i < n; i++)
+     {
+       vx[i] = gx[i] * gx[i] - gy[i] * gy[i];
+       vy[i] = 2.0 * gx[i] * gy[i];
+       mag[i] = hypot (gx[i], gy[i]);
++      gdir[i] = atan2 (gy[i], gx[i]);
+     }
+ 
+   /* Smoothed orientation field. */
+@@ -151,25 +155,44 @@ gx_sift_extract (const double *img, int w, int h)
+   f = g_new0 (GxSiftFeatures, 1);
+   f->pts = g_new0 (GxSiftPoint, GX_SIFT_MAX_PTS);
+ 
+-  /* Pick maxima, enforcing a minimum spacing. */
+-  for (k = 0; k < GX_SIFT_MAX_PTS; k++)
+-    {
+-      int best = -1;
+-      double bv = 0.0;
+-
+-      for (i = 0; i < n; i++)
+-        if (sal[i] > bv)
+-          { bv = sal[i]; best = i; }
+-      if (best < 0)
+-        break;
+-      x = best % w; y = best / w;
+-      f->pts[f->n].x = x;
+-      f->pts[f->n].y = y;
+-      f->n++;
+-      for (int yy = MAX (0, y - 6); yy < MIN (h, y + 7); yy++)
+-        for (int xx = MAX (0, x - 6); xx < MIN (w, x + 7); xx++)
+-          sal[yy * w + xx] = 0.0;
+-    }
++  /* Pick maxima, enforcing a minimum spacing. Each pick is the first global
++   * maximum in raster order. The maximum of every row is cached and only the
++   * rows the suppression window touched are rescanned: rescanning the whole
++   * image for each point was a third of the extraction time. */
++  {
++    g_autofree int *row_best = g_new (int, h);   /* index of the row's maximum */
++    int dirty0 = 0, dirty1 = h;
++
++    for (k = 0; k < GX_SIFT_MAX_PTS; k++)
++      {
++        int best = -1;
++        double bv = 0.0;
++
++        for (y = dirty0; y < dirty1; y++)
++          {
++            double rv = 0.0;
++
++            row_best[y] = -1;
++            for (i = y * w; i < (y + 1) * w; i++)
++              if (sal[i] > rv)
++                { rv = sal[i]; row_best[y] = i; }
++          }
++        for (y = 0; y < h; y++)
++          if (row_best[y] >= 0 && sal[row_best[y]] > bv)
++            { bv = sal[row_best[y]]; best = row_best[y]; }
++        if (best < 0)
++          break;
++        x = best % w; y = best / w;
++        f->pts[f->n].x = x;
++        f->pts[f->n].y = y;
++        f->n++;
++        dirty0 = MAX (0, y - 6);
++        dirty1 = MIN (h, y + 7);
++        for (int yy = dirty0; yy < dirty1; yy++)
++          for (int xx = MAX (0, x - 6); xx < MIN (w, x + 7); xx++)
++            sal[yy * w + xx] = 0.0;
++      }
++  }
+ 
+   /* Descriptors. */
+   for (k = 0; k < (int) f->n; k++)
+@@ -197,7 +220,7 @@ gx_sift_extract (const double *img, int w, int h)
+               continue;
+             if (yy < 0 || yy >= h || xx < 0 || xx >= w)
+               continue;
+-            ang = atan2 (gy[yy * w + xx], gx[yy * w + xx]) - a;
++            ang = gdir[yy * w + xx] - a;
+             g = fmod (ang, 2 * M_PI);
+             if (g < 0) g += 2 * M_PI;
+             b = (int) (g / (2 * M_PI) * GX_SIFT_BINS) % GX_SIFT_BINS;
+@@ -438,6 +461,72 @@ gx_sift_match_mask (const GxSiftFeatures *A, const GxSiftFeatures *B,
+   return best;
+ }
+ 
++/* Fused score: the number of capture points that AT LEAST ONE template view
++ * explains. A press often overlaps several views without covering any of them
++ * decisively; taking the best single view threw that distributed evidence
++ * away. Chance matches from a foreign finger do not accumulate the same way:
++ * they fail the geometric check.
++ *
++ * The views are independent, so they are matched on several threads; the
++ * result is the same whatever the split. */
++#define GX_FUSE_THREADS 4
++
++typedef struct
++{
++  GPtrArray            *views;
++  const GxSiftFeatures *probe;
++  gint                  next;   /* next view to match (atomic) */
++  GMutex                lock;   /* guards @seen */
++  guint8               *seen;
++} FuseJob;
++
++static gpointer
++fuse_worker (gpointer data)
++{
++  FuseJob *job = data;
++  g_autofree guint8 *mask = g_new0 (guint8, job->probe->n);
++  guint i, k;
++
++  while ((i = (guint) g_atomic_int_add (&job->next, 1)) < job->views->len)
++    gx_sift_match_mask (g_ptr_array_index (job->views, i), job->probe, mask);
++  g_mutex_lock (&job->lock);
++  for (k = 0; k < job->probe->n; k++)
++    job->seen[k] |= mask[k];
++  g_mutex_unlock (&job->lock);
++  return NULL;
++}
++
++int
++gx_sift_fused_score (GPtrArray *views, const GxSiftFeatures *probe)
++{
++  FuseJob job = { .views = views, .probe = probe };
++  GThread *helpers[GX_FUSE_THREADS - 1];
++  guint n_helpers = 0, want, i;
++  int score = 0;
++
++  job.seen = g_new0 (guint8, probe->n);
++  g_mutex_init (&job.lock);
++  want = MIN (MIN (g_get_num_processors (), GX_FUSE_THREADS), views->len);
++  /* A helper that cannot be started is not missed: the others, this thread
++   * included, take its share. */
++  for (i = 1; i < want; i++)
++    {
++      GThread *t = g_thread_try_new ("gx-match", fuse_worker, &job, NULL);
++
++      if (t)
++        helpers[n_helpers++] = t;
++    }
++  fuse_worker (&job);
++  for (i = 0; i < n_helpers; i++)
++    g_thread_join (helpers[i]);
++  g_mutex_clear (&job.lock);
++
++  for (i = 0; i < probe->n; i++)
++    score += job.seen[i];
++  g_free (job.seen);
++  return score;
++}
++
+ 
+ /* ------------------------------------------------------------------ */
+ /*  Serialisation                                                      */
+diff --git a/libfprint/drivers/goodixtls/goodix_sift.h b/libfprint/drivers/goodixtls/goodix_sift.h
+index 979d8b96..a5d14f95 100644
+--- a/libfprint/drivers/goodixtls/goodix_sift.h
++++ b/libfprint/drivers/goodixtls/goodix_sift.h
+@@ -83,6 +83,10 @@ void gx_sift_free (GxSiftFeatures *f);
+ int gx_sift_match_mask (const GxSiftFeatures *a, const GxSiftFeatures *b,
+                         guint8 *mask);
+ 
++/* Fused score of capture @probe against a whole template: the number of its
++ * points that at least one of @views (GxSiftFeatures) explains. */
++int gx_sift_fused_score (GPtrArray *views, const GxSiftFeatures *probe);
++
+ /*
+  * Incremental registration, used to guide enrolment in real time.
+  *
+diff --git a/libfprint/drivers/goodixtls/goodixtls.c b/libfprint/drivers/goodixtls/goodixtls.c
+index 0c592234..4e62b917 100644
+--- a/libfprint/drivers/goodixtls/goodixtls.c
++++ b/libfprint/drivers/goodixtls/goodixtls.c
+@@ -53,6 +53,7 @@
+ #include <poll.h>
+ #include <stdio.h>
+ #include <string.h>
++#include <time.h>
+ #include <unistd.h>
+ #include <sys/file.h>
+ #include <sys/ioctl.h>
+@@ -76,9 +77,6 @@
+                                         sent back to back are dropped) */
+ #define GX_NOP_GAP_US        8000    /* NOP preamble -> command */
+ #define GX_CFG_NOP_GAP_US    15000   /* NOP preamble -> configuration upload */
+-#define GX_SEQ_GAP_US        30000   /* between capture-sequence commands
+-                                        (measured under the old transport) */
+-#define GX_MCU_STATE_GAP_US  80000   /* after the MCU-state query over TLS */
+ #define GX_TLS_OK_SETTLE_US  50000   /* our Finished -> 0xD4 (too soon and the
+                                         MCU does not advance its TLS state) */
+ #define GX_HDR_BODY_US       200     /* header read -> body read */
+@@ -88,8 +86,6 @@
+ /* Receive timeouts. */
+ #define GX_ACK_TIMEOUT_MS    200
+ #define GX_TLS_RX_TIMEOUT_MS 3000    /* the image takes a while to produce */
+-#define GX_DRAIN_FIRST_MS    300
+-#define GX_DRAIN_SILENCE_MS  60
+ 
+ /* GPIO lines of the MateBook X Pro, used when the ACPI tables cannot be read. */
+ #define GX_IRQ_LINE_DEFAULT   23
+@@ -123,7 +119,6 @@ struct _FpiDeviceGoodixTls
+   gchar        *gpiochip;     /* chip holding the reset and IRQ lines */
+   guint         reset_line;
+   gint64        last_xfer;    /* monotonic time the last SPI transaction ended */
+-  gint64        quiet_until;  /* no write before this (command spacing) */
+ 
+   /* TLS stack. Note the sensor is the client and we are the server. */
+   GxTls        *tls;
+@@ -136,9 +131,11 @@ struct _FpiDeviceGoodixTls
+   int           tls_rxlen, tls_rxpos;
+ 
+   guint16      *bg_frame;     /* background, NULL until calibrated */
++  gint64        bg_time;      /* boot-time clock when it was taken; 0: not reusable */
+   int           fdt_base[12]; /* finger-detection baseline (finger absent) */
+   int           fdt_abs;      /* per-unit absolute floor, derived from baseline */
+   gboolean      bg_dirty;     /* background taken with a finger down */
++  gboolean      await_lift;   /* the press on the sensor has already been used */
+ };
+ 
+ G_DECLARE_FINAL_TYPE (FpiDeviceGoodixTls, fpi_device_goodixtls, FPI,
+@@ -175,8 +172,8 @@ static const guint8 GX_REQTLS[] = { 0xd0, 0x03, 0x00, 0x00, 0x00, 0xd7 };
+ static const guint8 GX_TLS_UNLOCK[] = { 0xd5, 0x03, 0x00, 0x00, 0x00, 0xd3 };
+ /* "TLS successfully established": tells the MCU the host side is done. */
+ static const guint8 GX_TLS_OK[] = { 0xd4, 0x03, 0x00, 0x00, 0x00, 0xd3 };
+-/* Finger detection ("FDT manual") with the reference levels of the capture
+- * sequence below; the reply carries twelve 16-bit zone values. */
++/* Finger detection ("FDT manual") with the vendor driver's reference levels;
++ * the reply carries twelve 16-bit zone values. */
+ static const guint8 GX_FDT_PROBE[] = {
+   0x36, 0x23, 0x00, 0x0d, 0x01, 0xa6, 0xa6, 0xb9, 0xb9, 0xbc, 0xbc, 0xb7,
+   0xb7, 0xa8, 0xa8, 0xba, 0xba, 0xb7, 0xb7, 0xb8, 0xb8, 0xa8, 0xa8, 0xc1,
+@@ -208,13 +205,6 @@ gx_spi_xfer (FpiDeviceGoodixTls *self, const guint8 *tx, guint8 *rx, gsize len)
+   return r == (int) len;
+ }
+ 
+-/* Keeps the bus silent for at least @us from now. */
+-static void
+-gx_quiet (FpiDeviceGoodixTls *self, gint64 us)
+-{
+-  self->quiet_until = MAX (self->quiet_until, g_get_monotonic_time () + us);
+-}
+-
+ /* Writes one frame: a 4-byte transport header then the body, in ONE transfer
+  * (chip select held). The Windows driver logs them as two writes, but this
+  * part ignores a split frame.
+@@ -236,7 +226,7 @@ gx_write_frame (FpiDeviceGoodixTls *self, guint8 type,
+   buf[3] = buf[0] + buf[1] + buf[2];
+   memcpy (buf + 4, body, n);
+ 
+-  ready = MAX (self->last_xfer + GX_FRAME_GAP_US, self->quiet_until);
++  ready = self->last_xfer + GX_FRAME_GAP_US;
+   now = g_get_monotonic_time ();
+   if (now < ready)
+     g_usleep (ready - now);
+@@ -945,64 +935,10 @@ gx_tls_session (FpiDeviceGoodixTls *self)
+ /*  Image capture                                                      */
+ /* ------------------------------------------------------------------ */
+ 
+-/* Capture sequence, byte for byte as observed on the wire from the vendor
+- * driver: MCU state, two rounds of finger-detection setup (reference levels,
+- * then raw levels), a navigation frame, two register reads, then the image. */
++/* MCU state query; its first byte reads 6 while the image path is up. */
+ static const guint8 SEQ_MCU[] = { 0xae, 0x0b, 0x00, 0x06, 0x00, 0xff, 0xff, 0x00, 0x08, 0xff, 0x01, 0x00, 0x1a, 0xcb };
+-static const guint8 SEQ_FDT_A2[] = { 0x36, 0x25, 0x00, 0x00, 0x01, 0x00, 0x00, 0x4e, 0x01, 0x75, 0x01, 0x7a, 0x01, 0x71, 0x01, 0x52, 0x01, 0x75, 0x01, 0x70, 0x01, 0x72, 0x01, 0x52, 0x01, 0x83, 0x01, 0x77, 0x01, 0x6c, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x33 };
+-static const guint8 SEQ_NAV[] = { 0x50, 0x03, 0x00, 0x01, 0x00, 0x56 };
+-static const guint8 SEQ_FDT_B1[] = { 0x36, 0x23, 0x00, 0x0d, 0x01, 0xa7, 0xa7, 0xba, 0xba, 0xbd, 0xbd, 0xb8, 0xb8, 0xa9, 0xa9, 0xba, 0xba, 0xb8, 0xb8, 0xb9, 0xb9, 0xa9, 0xa9, 0xc1, 0xc1, 0xbb, 0xbb, 0xb6, 0xb6, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x39 };
+-static const guint8 SEQ_FDT_B2[] = { 0x36, 0x25, 0x00, 0x00, 0x01, 0x00, 0x00, 0x4d, 0x01, 0x74, 0x01, 0x79, 0x01, 0x70, 0x01, 0x51, 0x01, 0x74, 0x01, 0x6f, 0x01, 0x71, 0x01, 0x51, 0x01, 0x83, 0x01, 0x76, 0x01, 0x6b, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3e };
+-static const guint8 SEQ_REG_A[] = { 0x82, 0x06, 0x00, 0x00, 0x82, 0x00, 0x02, 0x00, 0x9e };
+-static const guint8 SEQ_REG_B[] = { 0x82, 0x03, 0x00, 0x14, 0x80, 0x91 };
+ static const guint8 SEQ_IMAGE[] = { 0x20, 0x03, 0x00, 0x01, 0x00, 0x86 };
+ 
+-static const struct { const guint8 *body; gsize len; } gx_capture_seq[] = {
+-  { SEQ_MCU, sizeof SEQ_MCU },
+-  { GX_FDT_PROBE, sizeof GX_FDT_PROBE },
+-  { SEQ_FDT_A2, sizeof SEQ_FDT_A2 },
+-  { SEQ_NAV, sizeof SEQ_NAV },
+-  { SEQ_FDT_B1, sizeof SEQ_FDT_B1 },
+-  { SEQ_FDT_B2, sizeof SEQ_FDT_B2 },
+-  { SEQ_REG_A, sizeof SEQ_REG_A },
+-  { SEQ_REG_B, sizeof SEQ_REG_B },
+-  { SEQ_IMAGE, sizeof SEQ_IMAGE },
+-};
+-
+-/* Sends one capture-sequence command and consumes its replies: the ACK, then
+- * the data reply carrying the same command byte or — for the image command —
+- * the TLS record, which is left in tls_rx for gx_capture_frame(). The next
+- * command must not follow within GX_SEQ_GAP_US: at 10 ms every capture failed
+- * and the sensor wedged (measured with the original transport, 19 out of 19). */
+-static void
+-gx_send_seq_cmd (FpiDeviceGoodixTls *self, const guint8 *body, gsize n)
+-{
+-  g_autofree guint8 *rx = g_malloc (GX_RX_MAX);
+-  guint8 ty;
+-  int got = 0;
+-
+-  gx_send_cmd (self, body, n, GX_NOP_GAP_US);
+-  for (;;)
+-    {
+-      int r = gx_recv (self, &ty, rx, GX_RX_MAX,
+-                       got ? GX_DRAIN_SILENCE_MS : GX_DRAIN_FIRST_MS);
+-
+-      if (r <= 0)
+-        break;                                 /* silence: exchange over */
+-      if (ty == GOODIX_PKT_TLS)
+-        {
+-          memcpy (self->tls_rx, rx, r);
+-          self->tls_rxlen = r;
+-          self->tls_rxpos = 0;
+-          break;
+-        }
+-      got++;
+-      if (rx[0] == body[0])
+-        break;                                 /* the data reply: complete */
+-    }
+-  gx_quiet (self, GX_SEQ_GAP_US);
+-}
+-
+ /* Decodes the 12-bit samples: six bytes carry four pixels, interleaved. */
+ static void
+ gx_decode_12bit (const guint8 *data, gsize len, guint16 *out, gsize n)
+@@ -1021,43 +957,39 @@ gx_decode_12bit (const guint8 *data, gsize len, guint16 *out, gsize n)
+ }
+ 
+ /* Captures one full image, assuming a TLS session is up, and fills
+- * px[GOODIX_IMG_PIXELS] with 12-bit samples. */
++ * px[GOODIX_IMG_PIXELS] with 12-bit samples.
++ *
++ * Only the image command is sent. The vendor driver precedes its first image
++ * with an activation sequence (MCU state over TLS, two rounds of
++ * finger-detection setup, a navigation frame, two register reads), and this
++ * driver used to replay all of it before every image: 480 of the 610 ms of a
++ * capture. The sensor does not need it. Measured on firmware 11034, straight
++ * after a reset and handshake as well as on a long-lived session: the frames
++ * differ from those taken after the full sequence by the sensor's noise (5
++ * counts on a fixed pattern of 550), and seven presses scored the same against
++ * backgrounds taken either way. */
+ static gboolean
+ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px)
+ {
+   g_autofree guint8 *img = g_malloc (GX_RX_MAX);
+-  guint8 st = 0x55, cmd[5];
++  gint64 t0 = g_get_monotonic_time ();
+   gssize got;
+-  gsize i;
+ 
+   /* After a failed capture the session is dropped (below): bring it back. */
+   if (!self->tls_up && !gx_tls_session (self))
+     return FALSE;
+ 
+-  /* MCU state query, over TLS. */
+-  gx_build_cmd (cmd, GOODIX_CMD_MCU_STATE, &st, 1);
+-  if (!gx_tls_write (self->tls, cmd, sizeof cmd))
+-    {
+-      gx_tls_teardown (self);
+-      return FALSE;
+-    }
+-  gx_quiet (self, GX_MCU_STATE_GAP_US);
+-
+-  self->tls_rxlen = self->tls_rxpos = 0;
+-  for (i = 0; i < G_N_ELEMENTS (gx_capture_seq); i++)
+-    gx_send_seq_cmd (self, gx_capture_seq[i].body, gx_capture_seq[i].len);
+-
+-  /* The image arrives as ONE record larger than TLS allows, so it is decrypted
+-   * here rather than handed to OpenSSL, which would reject it outright. It has
+-   * normally been picked up by the last command of the sequence. */
+-  if (self->tls_rxpos >= self->tls_rxlen && !gx_fetch_tls_record (self))
++  /* The ACK comes back in cleartext and is skipped; the image follows about
++   * 120 ms later, as ONE record larger than TLS allows, so it is decrypted
++   * here rather than handed to OpenSSL, which would reject it outright. */
++  if (!gx_send_cmd (self, SEQ_IMAGE, sizeof SEQ_IMAGE, GX_NOP_GAP_US) ||
++      !gx_fetch_tls_record (self))
+     {
+       fp_warn ("no image record from the sensor");
+       gx_tls_teardown (self);
+       return FALSE;
+     }
+-  got = gx_tls_decrypt_record (self->tls, self->tls_rx + self->tls_rxpos,
+-                               self->tls_rxlen - self->tls_rxpos,
++  got = gx_tls_decrypt_record (self->tls, self->tls_rx, self->tls_rxlen,
+                                img, GX_RX_MAX);
+   self->tls_rxlen = self->tls_rxpos = 0;
+   /* 8-byte header, then 12 bits per pixel. */
+@@ -1073,6 +1005,7 @@ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px)
+   /* Header is a tag, a 16-bit length and five zero bytes, then the 12-bit
+    * samples: skip 8 bytes. */
+   gx_decode_12bit (img + 8, got - 8, px, GOODIX_IMG_PIXELS);
++  fp_dbg ("image captured in %d ms", (int) ((g_get_monotonic_time () - t0) / 1000));
+   return TRUE;
+ }
+ 
+@@ -1081,7 +1014,7 @@ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px)
+ /* ------------------------------------------------------------------ */
+ 
+ /* Native finger detection: twelve 16-bit values, one per sensor zone, in about
+- * 30 ms — much faster than capturing an image. A finger pulls those values
++ * 17 ms — much faster than capturing an image. A finger pulls those values
+  * DOWN by roughly 100 counts, which is what makes cheap polling possible. */
+ static gboolean
+ gx_fdt_probe (FpiDeviceGoodixTls *self, int *out12)
+@@ -1152,7 +1085,7 @@ gx_finger_present (FpiDeviceGoodixTls *self)
+  * sensor when the operation starts ends up in the background, the difference
+  * then cancels out, and the capture is worthless — observed as verifications
+  * collapsing from about 100 matches to 6. So wait for the finger to go (probe
+- * first: a probe costs 30 ms, a background capture 0.6 s), capture, and redo
++ * first: a probe costs 17 ms, a background capture 130 ms), capture, and redo
+  * it if a finger landed during the capture. The presence test is the ABSOLUTE
+  * one: the relative baseline is precisely what comes next. */
+ static gboolean
+@@ -1195,13 +1128,14 @@ gx_take_background (FpiDeviceGoodixTls *self)
+ /* Detection baseline; taken right after the background, finger absent. The
+  * absolute floor is derived from THIS unit's idle level rather than a fixed
+  * number: a finger only ever pulls the mean down, so the floor sits a fixed
+- * margin below idle wherever idle happens to be. */
++ * margin below idle wherever idle happens to be. Two probes are plenty: idle
++ * readings stay within 3 counts of each other, against margins of 24 and 30. */
+ static gboolean
+ gx_calibrate_fdt (FpiDeviceGoodixTls *self)
+ {
+   int t[12], acc[12] = { 0 }, nb = 0, q, k;
+ 
+-  for (q = 0; q < 4; q++)
++  for (q = 0; q < 2; q++)
+     if (gx_fdt_probe (self, t))
+       {
+         for (k = 0; k < 12; k++)
+@@ -1218,19 +1152,54 @@ gx_calibrate_fdt (FpiDeviceGoodixTls *self)
+   return TRUE;
+ }
+ 
++/* How long a background, and the detection baseline taken with it, may serve
++ * later verifications. Measured on firmware 11034: seven presses, each scored
++ * against nineteen backgrounds taken from 160 s before it to 110 s after it,
++ * show no trend with age (the spread, about 6 either way, is the same between
++ * backgrounds a few seconds apart), and the idle detection level stayed within
++ * 3 counts throughout, presses included. An earlier measurement on another
++ * unit saw the score collapse with a background "a few tens of seconds old"
++ * (2-4 matches against 11-28). Hence a short limit rather than none, and two
++ * safeguards: a verification that fails to match, or whose image is rejected,
++ * drops the background, so that a stale one costs a single attempt at most;
++ * and the age runs on the boot-time clock, so that hours of suspend do not
++ * pass for seconds. A verification left waiting for a finger keeps the
++ * background it started with, up to 30 s more. */
++#define GX_BG_MAX_AGE_S 60
++
++/* Like g_get_monotonic_time(), but counting the time spent suspended. */
++static gint64
++gx_boottime_us (void)
++{
++  struct timespec ts;
++
++  clock_gettime (CLOCK_BOOTTIME, &ts);
++  return (gint64) ts.tv_sec * G_USEC_PER_SEC + ts.tv_nsec / 1000;
++}
++
+ /* Brings the sensor to "ready to capture": TLS up (kept across operations),
+- * then a fresh background and detection baseline. These two must be taken
+- * JUST BEFORE each operation: the baseline drifts, and a background a few tens
+- * of seconds old collapses the score (measured: 11-28 matches with a fresh one
+- * against 2-4). */
++ * then a background and a detection baseline. A verification reuses recent
++ * ones, which makes the sensor ready at once; enrolment (@fresh) never does,
++ * since what it captures stays in the template. */
+ static gboolean
+-gx_session_start (FpiDeviceGoodixTls *self)
++gx_session_start (FpiDeviceGoodixTls *self, gboolean fresh)
+ {
+   gint64 t0 = g_get_monotonic_time ();
+ 
+   if (!gx_tls_session (self))
+     return FALSE;
+   self->bg_dirty = FALSE;
++  if (!fresh && self->bg_time)
++    {
++      gint64 age = gx_boottime_us () - self->bg_time;
++
++      if (age < GX_BG_MAX_AGE_S * G_USEC_PER_SEC)
++        {
++          fp_dbg ("background reused (%d s old)", (int) (age / G_USEC_PER_SEC));
++          return TRUE;
++        }
++    }
++  self->bg_time = 0;
+   if (!self->bg_frame)
+     self->bg_frame = g_new (guint16, GOODIX_IMG_PIXELS);
+   if (!gx_take_background (self))
+@@ -1241,6 +1210,11 @@ gx_session_start (FpiDeviceGoodixTls *self)
+     return TRUE;
+   if (!gx_calibrate_fdt (self))
+     return FALSE;
++  self->bg_time = gx_boottime_us ();
++  /* Taken with the finger off by the absolute test, the one gx_take_background()
++   * applies: a touch within GOODIX_FDT_ABS_MARGIN of idle passes for lifted
++   * here, as it did when every operation took a new background. */
++  self->await_lift = FALSE;
+   fp_dbg ("session ready in %d ms", (int) ((g_get_monotonic_time () - t0) / 1000));
+   return TRUE;
+ }
+@@ -1377,25 +1351,6 @@ gx_capture_features (FpiDeviceGoodixTls *self)
+  * re-measure after an enrolment that covers much more of the finger. */
+ #define GX_MATCH_THRESHOLD 12
+ 
+-/* Fused score: the number of capture points that AT LEAST ONE template view
+- * explains. A press often overlaps several views without covering any of them
+- * decisively; taking the best single view threw that distributed evidence
+- * away. Chance matches from a foreign finger do not accumulate the same way:
+- * they fail the geometric check. */
+-static int
+-gx_fused_score (GPtrArray *views, const GxSiftFeatures *probe)
+-{
+-  g_autofree guint8 *seen = g_new0 (guint8, probe->n);
+-  int score = 0;
+-  guint i;
+-
+-  for (i = 0; i < views->len; i++)
+-    gx_sift_match_mask (g_ptr_array_index (views, i), probe, seen);
+-  for (i = 0; i < probe->n; i++)
+-    score += seen[i];
+-  return score;
+-}
+-
+ /* What determines template quality is the number of DISTINCT presses, not the
+  * raw number of captures: two captures back to back show almost the same area.
+  * Coverage is the dominant factor. */
+@@ -1639,6 +1594,8 @@ typedef struct
+   int             score;      /* verify: its fused score */
+   int             stage;      /* enrol: presses accepted so far */
+   int             polls;      /* detection polls in the current wait state */
++  int             landing;    /* polls since the finger was first seen */
++  int             land_mean;  /* detection level at the previous of those */
+   GxSiftIsland   *island;     /* enrol: coverage map, for guidance logs */
+ } GxTask;
+ 
+@@ -1661,19 +1618,30 @@ enum {
+   GX_ST_NUM,
+ };
+ 
+-#define GX_POLL_MS     100     /* detection polling period */
+-#define GX_POLL_MAX    300     /* about 30 s before giving up */
+-#define GX_POLL_OFF    100     /* about 10 s to wait for release */
++#define GX_POLL_MS     50      /* detection polling period */
++#define GX_POLL_MAX    600     /* 30 s before giving up */
++#define GX_POLL_OFF    200     /* 10 s to wait for release */
++
++/* Detection fires while the finger is still landing, at 65-85 % of the level
++ * it settles at, and the image command now follows at once (the activation
++ * sequence used to put half a second in between). Measured on twelve
++ * deliberately hasty presses: the image taken at first detection matched for
++ * two of them, the one taken 150 ms later for four. So the capture waits for
++ * two readings that no longer sink, or for GX_SETTLE_POLLS of them. */
++#define GX_SETTLE_MS     30    /* between those readings */
++#define GX_SETTLE_COUNTS 8     /* still sinking by more than this: not settled */
++#define GX_SETTLE_POLLS  3
+ 
+ /* --- off-loading the blocking work -----------------------------------
+  *
+- * Session setup (TLS handshake plus a background capture) and image capture
+- * take most of a second each and go through OpenSSL's blocking API over a
+- * synchronous SPI descriptor. Run inline they froze fprintd's main loop, so
+- * they run in a worker thread, the result coming back on the main loop.
+- * libfprint runs one operation at a time and the state machine waits for the
+- * callback, so nothing else touches the device meanwhile. Finger detection
+- * polls stay on the main loop: about 30 ms each. */
++ * Session setup (a TLS handshake when there is no session, a background
++ * capture when there is none recent) and image capture take from 0.15 s to
++ * most of a second and go through OpenSSL's blocking API over a synchronous
++ * SPI descriptor. Run inline they froze fprintd's main loop, so they run in a
++ * worker thread, the result coming back on the main loop. libfprint runs one
++ * operation at a time and the state machine waits for the callback, so
++ * nothing else touches the device meanwhile. Finger detection polls stay on
++ * the main loop: about 17 ms each. */
+ 
+ typedef struct
+ {
+@@ -1699,8 +1667,9 @@ static void
+ gx_session_thread (GTask *task, gpointer src, gpointer data, GCancellable *c)
+ {
+   GxWork *w = data;
++  GxTask *t = fpi_ssm_get_data (w->ssm);
+ 
+-  w->ok = gx_session_start (FPI_DEVICE_GOODIXTLS (w->dev));
++  w->ok = gx_session_start (FPI_DEVICE_GOODIXTLS (w->dev), !t->verifying);
+   g_task_return_boolean (task, TRUE);
+ }
+ 
+@@ -1720,9 +1689,9 @@ gx_capture_thread (GTask *task, gpointer src, gpointer data, GCancellable *c)
+   if (t->verifying)
+     {
+       /* Scored here rather than on the main loop: matching against up to
+-       * fifty views takes tens of milliseconds. t->views is read-only while
+-       * the capture runs. */
+-      w->score = gx_fused_score (t->views, w->feat);
++       * fifty views takes tens of milliseconds of processor time. t->views
++       * is read-only while the capture runs. */
++      w->score = gx_sift_fused_score (t->views, w->feat);
+       goto out;
+     }
+ 
+@@ -1812,17 +1781,24 @@ gx_capture_done (GObject *src, GAsyncResult *res, gpointer user_data)
+   GxWork *w = g_task_get_task_data (G_TASK (res));
+   FpiSsm *ssm = w->ssm;
+   FpDevice *dev = w->dev;
++  FpiDeviceGoodixTls *self = FPI_DEVICE_GOODIXTLS (dev);
+   GxTask *t = fpi_ssm_get_data (ssm);
+ 
++  /* This press is spent, whatever came of it: see gx_wait_on(). */
++  self->await_lift = TRUE;
++
+   if (!w->ok)
+     {
+       /* Tell the two causes apart: they call for opposite gestures. A finger
+        * pressed and lifted at once does trigger detection, but the image is
+        * taken once it has gone. */
+-      FpDeviceRetry why = gx_finger_present (FPI_DEVICE_GOODIXTLS (dev))
++      FpDeviceRetry why = gx_finger_present (self)
+                             ? FP_DEVICE_RETRY_CENTER_FINGER
+                             : FP_DEVICE_RETRY_TOO_SHORT;
+ 
++      /* The background may be what spoiled the image: take a new one. */
++      self->bg_time = 0;
++
+       if (t->verifying)
+         {
+           fpi_ssm_mark_failed (ssm, fpi_device_retry_new (why));
+@@ -1851,8 +1827,9 @@ gx_capture_done (GObject *src, GAsyncResult *res, gpointer user_data)
+ 
+   /* A verification is decided now: reporting it only once the finger has
+    * been lifted held the unlock back for as long as the finger rested on the
+-   * sensor. (A finger still down when the next operation starts is handled by
+-   * its background wait.) Enrolment does need the lift between presses. */
++   * sensor. (A finger still down when the next operation starts has to be
++   * lifted first: see gx_wait_on().) Enrolment does need the lift between
++   * presses. */
+   if (t->verifying)
+     {
+       fpi_ssm_jump_to_state (ssm, GX_ST_DONE);
+@@ -1886,23 +1863,44 @@ gx_wait_on (FpiSsm *ssm, FpDevice *dev, GxTask *t)
+ 
+   if (gx_cancelled (dev, ssm))
+     return;
+-  if (t->polls == 0)
++  /* Not on the settling re-entries: that would drop PRESENT for 30 ms. */
++  if (t->polls == 0 && t->landing == 0)
+     fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NEEDED);
+   if (gx_fdt_probe (self, cur))
+     {
+-      if (t->polls % 10 == 0)
++      if (t->polls % 20 == 0)
+         fp_dbg ("wait-on: mean=%d drop=%d (floor %d / drop %d)",
+                 gx_fdt_mean (cur), gx_fdt_drop (self->fdt_base, cur),
+                 self->fdt_abs, GOODIX_FDT_DROP);
+-      if (gx_fdt_is_finger (self, cur))
++      /* A press that has served a capture does not serve another one. With a
++       * reused background nothing else separates two operations, and a finger
++       * resting on the sensor after an unlock would approve whatever asks
++       * next. */
++      if (self->await_lift)
++        self->await_lift = !gx_fdt_is_lifted (self, cur);
++      else if (gx_fdt_is_finger (self, cur))
+         {
+-          /* Keep NEEDED asserted: the capture still takes ~0.6 s and the
++          int mean = gx_fdt_mean (cur);
++          gboolean settled = t->landing > 0 &&
++                             t->land_mean - mean <= GX_SETTLE_COUNTS;
++
++          /* Keep NEEDED asserted: the capture still takes 0.15 s and the
+            * finger must stay down for it. */
+           fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NEEDED |
+                                                 FP_FINGER_STATUS_PRESENT);
+-          fpi_ssm_jump_to_state (ssm, GX_ST_CAPTURE);
++          if (settled || t->landing >= GX_SETTLE_POLLS)
++            {
++              t->landing = 0;
++              fpi_ssm_jump_to_state (ssm, GX_ST_CAPTURE);
++              return;
++            }
++          t->landing++;
++          t->land_mean = mean;
++          fpi_ssm_jump_to_state_delayed (ssm, GX_ST_WAIT_ON, GX_SETTLE_MS);
+           return;
+         }
++      else
++        t->landing = 0;
+     }
+   if (++t->polls > GX_POLL_MAX)
+     {
+@@ -1920,8 +1918,9 @@ gx_wait_off (FpiSsm *ssm, FpDevice *dev, GxTask *t)
+ 
+   if (gx_cancelled (dev, ssm))
+     return;
+-  if ((gx_fdt_probe (self, cur) && gx_fdt_is_lifted (self, cur)) ||
+-      ++t->polls > GX_POLL_OFF)
++  if (gx_fdt_probe (self, cur) && gx_fdt_is_lifted (self, cur))
++    self->await_lift = FALSE;
++  if (!self->await_lift || ++t->polls > GX_POLL_OFF)
+     {
+       fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NONE);
+       t->polls = 0;
+@@ -2013,6 +2012,10 @@ gx_verify_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+   fp_info ("verify: %d matches (threshold %d, %u views + %u acquired)",
+            t->score, GX_MATCH_THRESHOLD, t->views->len - t->n_adapt, t->n_adapt);
+ 
++  /* A stale background costs one attempt at most: see GX_BG_MAX_AGE_S. */
++  if (t->score < GX_MATCH_THRESHOLD)
++    FPI_DEVICE_GOODIXTLS (dev)->bg_time = 0;
++
+   /* Acquisition window. The lower bound means certain identity; the upper
+    * bound means the area is already well covered. Weak poses — precisely the
+    * ones missing from the template — are excluded on purpose, being too
+diff --git a/libfprint/drivers/goodixtls/goodixtls.h b/libfprint/drivers/goodixtls/goodixtls.h
+index dfbcffad..121ef86d 100644
+--- a/libfprint/drivers/goodixtls/goodixtls.h
++++ b/libfprint/drivers/goodixtls/goodixtls.h
+@@ -41,7 +41,6 @@
+  * cmd0 being the group: 0x2 image, 0x3 finger detect, 0x5 navigation,
+  * 0x8 register, 0x9 chip, 0xA MCU, 0xD TLS connection, 0xF memory. */
+ #define GOODIX_CMD_UPLOAD_CFG  0x90
+-#define GOODIX_CMD_MCU_STATE   0xAE
+ #define GOODIX_CMD_MEM_READ    0xF2   /* arbitrary memory read: [addr32][len32] */
+ 
+ /*
